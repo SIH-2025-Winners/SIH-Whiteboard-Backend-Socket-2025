@@ -15,8 +15,6 @@ const path = require("path");
 const { v4: uuidv4 } = require("uuid");
 const pdfPoppler = require("pdf-poppler");
 const cloudinary = require("cloudinary").v2;
-const dotenv = require("dotenv");
-dotenv.config();
 
 const server = http.createServer(app);
 connectDB();
