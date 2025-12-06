@@ -8,8 +8,15 @@ const pako = require("pako");
 require("dotenv").config();
 // If you don't use GoogleGenerativeAI in production, you can remove related code
 const { GoogleGenerativeAI } = require("@google/generative-ai");
-const connectDB = require('./lib/dbConnect');
+const connectDB = require("./lib/dbConnect");
 const { default: Classes } = require("./models/Classes");
+const fs = require("fs-extra");
+const path = require("path");
+const { v4: uuidv4 } = require("uuid");
+const pdfPoppler = require("pdf-poppler");
+const cloudinary = require("cloudinary").v2;
+const dotenv = require("dotenv");
+dotenv.config();
 
 const server = http.createServer(app);
 connectDB();
@@ -42,16 +49,284 @@ app.use(express.json());
  * Note: This is memory-only. For persistence, move to DB.
  */
 let rooms = {};
+const pdfChunkStore = {};
 
 // setInterval(() => {
 //   console.log("\n\nCurrent rooms state:", JSON.stringify(rooms));
 // }, 5000);
 
 // Utilities
+
+cloudinary.config({
+  cloud_name: process.env.YOUR_CLOUD_NAME,
+  api_key: process.env.YOUR_API_KEY,
+  api_secret: process.env.YOUR_SECRET,
+});
+
+function registerPdfUploadHandler(io, socket) {
+  socket.on(
+    "upload-pdf-chunk",
+    async ({ roomID, fileName, fileType, chunkIndex, totalChunks, chunk }) => {
+      const key = `${roomID}-${fileName}`;
+
+      // Create storage if not exists
+      if (!pdfChunkStore[key]) {
+        pdfChunkStore[key] = {
+          chunks: [],
+          totalChunks,
+          fileType,
+          roomID,
+          fileName,
+        };
+      }
+
+      // Save chunk
+      pdfChunkStore[key].chunks[chunkIndex] = Buffer.from(chunk);
+
+      const received = pdfChunkStore[key].chunks.filter(Boolean).length;
+      console.log(`PDF chunk ${received}/${totalChunks} received`);
+
+      // If PDF fully received
+      if (received === totalChunks) {
+        console.log("All chunks received, assembling...");
+
+        const finalBuffer = Buffer.concat(pdfChunkStore[key].chunks);
+
+        // Clear chunk storage
+        delete pdfChunkStore[key];
+
+        // Process the PDF using your existing pipeline
+        await processFullPdf(io, socket, roomID, fileName, finalBuffer);
+      }
+    }
+  );
+}
+
+async function processFullPdf(io, socket, roomID, fileName, fileBuffer) {
+  try {
+    console.log("Saving temp PDF...");
+    const tmpDir = path.join(process.cwd(), "tmp_pdf_uploads");
+    await fs.ensureDir(tmpDir);
+
+    const pdfPath = path.join(tmpDir, `upload-${Date.now()}.pdf`);
+    await fs.writeFile(pdfPath, fileBuffer);
+
+    console.log("Converting PDF to images...");
+    const imagesOutputDir = path.join(tmpDir, `images-${Date.now()}`);
+    const imagePaths = await convertPdfToImages(pdfPath, imagesOutputDir);
+
+    console.log("Uploading images to Cloudinary...");
+    const cloudUrls = await uploadImagesToCloudinary(imagePaths, roomID);
+
+    const room = rooms[roomID];
+
+    for (let i = 0; i < cloudUrls.length; i++) {
+      const { url, width, height } = cloudUrls[i];
+      const slideId = `slide-${Date.now()}-${uuidv4()}`;
+      const elementId = `el-${uuidv4()}`;
+
+      const slide = {
+        id: slideId,
+        title: `${fileName} - Page ${i + 1}`,
+        elements: [
+          {
+            id: elementId,
+            type: "image",
+            src: url,
+            x1: 50,
+            y1: 50,
+            width: width,
+            height: height,
+            rotation: 0,
+            locked: false,
+          },
+        ],
+      };
+
+      room.slides.push(slide);
+      room.currentSlide = room.slides.length - 1;
+
+      io.to(roomID).emit("slide-created", {
+        slide,
+        currentSlide: room.currentSlide,
+      });
+
+      console.log("Emitted slide:", slideId);
+    }
+
+    await fs.remove(tmpDir);
+
+    socket.emit("upload-pdf-done", { pages: cloudUrls.length });
+  } catch (err) {
+    console.error("PDF processing failed:", err);
+    socket.emit("file-error", { message: err.message });
+  }
+}
+
+async function savePdfTemp(fileDataArray) {
+  console.log("Saving PDF temporarily...");
+  const tmpDir = path.join(process.cwd(), "tmp_pdf_uploads");
+  await fs.ensureDir(tmpDir);
+  const fileName = `upload-${Date.now()}-${uuidv4()}.pdf`;
+  const pdfPath = path.join(tmpDir, fileName);
+  const buffer = Buffer.from(fileDataArray);
+  await fs.writeFile(pdfPath, buffer);
+  console.log("PDF saved at:", pdfPath);
+  return { pdfPath, tmpDir };
+}
+
+// helper: convert pdf to images using pdf-poppler
+async function convertPdfToImages(pdfPath, outputDir) {
+  await fs.ensureDir(outputDir);
+
+  const opts = {
+    format: "png", // png or jpeg
+    out_dir: outputDir,
+    out_prefix: "slide",
+    page: null, // null => all pages
+    scale: 1090, // adjust quality/size; higher = bigger images
+  };
+
+  // pdf-poppler returns a Promise
+  console.log("Converting PDF to images...");
+  await pdfPoppler.convert(pdfPath, opts);
+  console.log("PDF conversion done. Listing output files...");
+
+  // list output files in lexicographic order (slide-1.png, slide-2.png, ...)
+  const files = (await fs.readdir(outputDir))
+    .filter(
+      (f) => f.startsWith("slide") && (f.endsWith(".png") || f.endsWith(".jpg"))
+    )
+    .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }))
+    .map((f) => path.join(outputDir, f));
+  console.log("Converted image files:", files);
+
+  return files;
+}
+
+// helper: upload local image paths to cloudinary (returns secure urls)
+async function uploadImagesToCloudinary(imagePaths, roomID) {
+  const urls = [];
+  for (const p of imagePaths) {
+    console.log("Uploading image to Cloudinary:", p);
+    const res = await cloudinary.uploader.upload(p, {
+      folder: `whiteboard/${roomID}`,
+      resource_type: "image",
+      use_filename: true,
+      unique_filename: true,
+    });
+    urls.push({
+      url: res.secure_url,
+      width: res.width,
+      height: res.height,
+    });
+  }
+  console.log("All images uploaded to Cloudinary.");
+  return urls;
+}
+
+// main socket handler registration (call this from where you have `io` and `socket`)
+// function registerPdfUploadHandler(io, socket) {
+//   socket.on("upload-pdf", async ({ roomID, fileName, fileType, fileData }) => {
+//     try {
+//       console.log(`upload-pdf received for room ${roomID}: ${fileName}`);
+
+//       // ensure room exists
+//       ensureRoom(roomID);
+//       const room = rooms[roomID];
+
+//       // Validate fileData
+//       if (!Array.isArray(fileData) || fileData.length < 10) {
+//         socket.emit("file-error", { message: "Invalid PDF payload" });
+//         return;
+//       }
+
+//       // 1) save incoming bytes to temp pdf
+//       const { pdfPath, tmpDir } = await savePdfTemp(fileData);
+//       console.log("Saved temp PDF:", pdfPath);
+
+//       // 2) convert pdf -> images
+//       const imagesOutputDir = path.join(tmpDir, `images-${Date.now()}`);
+//       const imagePaths = await convertPdfToImages(pdfPath, imagesOutputDir);
+//       if (!imagePaths || imagePaths.length === 0) {
+//         throw new Error("PDF conversion yielded no images");
+//       }
+//       console.log("Converted PDF to images:", imagePaths.length);
+
+//       // 3) upload images to Cloudinary
+//       const cloudUrls = await uploadImagesToCloudinary(imagePaths, roomID);
+//       console.log(
+//         "Uploaded images to Cloudinary. URLs count:",
+//         cloudUrls.length
+//       );
+
+//       // 4) For each page/url create slide in-memory and emit slide-created to room
+//       for (let i = 0; i < cloudUrls.length; i++) {
+//         const {url, width, height} = cloudUrls[i];
+
+//         const slideId = `slide-${Date.now()}-${uuidv4()}`;
+//         const elementId = `el-${uuidv4()}`;
+
+//         // create slide object with image element (fits your reducer shape)
+//         const slide = {
+//           id: slideId,
+//           title: `${fileName} - Page ${i + 1}`,
+//           elements: [
+//             {
+//               id: elementId,
+//               type: "image",
+//               src: url, // frontend expects element.src
+//               x1: 50,
+//               y1: 50,
+//               width: width/1.3, // defaults, adjust as you like
+//               height: height/1.3,
+//               rotation: 0,
+//               locked: false,
+//             },
+//           ],
+//         };
+
+//         // append to in-memory room state
+//         room.slides.push(slide);
+//         room.currentSlide = room.slides.length - 1;
+
+//         // Emit to everyone (including uploader)
+//         io.to(roomID).emit("slide-created", {
+//           slide,
+//           currentSlide: room.currentSlide,
+//         });
+
+//         console.log(`Emitted slide-created for room ${roomID} - ${slideId}`);
+//       }
+
+//       // 5) cleanup temp files
+//       try {
+//         await fs.remove(tmpDir);
+//         console.log("Cleaned up tmp dir:", tmpDir);
+//       } catch (cleanupErr) {
+//         console.warn("Failed to cleanup tmp files:", cleanupErr);
+//       }
+
+//       // Optionally notify uploader success
+//       socket.emit("upload-pdf-done", { pages: cloudUrls.length });
+//     } catch (err) {
+//       console.error("Error processing upload-pdf:", err);
+//       socket.emit("file-error", { message: err.message || "Processing error" });
+//     }
+//   });
+// }
+
 const compress = (data) => {
   const json = JSON.stringify(data);
   return pako.deflate(json);
 };
+
+async function savePdfLocally(base64) {
+  const buffer = Buffer.from(base64.split(",")[1], "base64");
+  const filePath = "./temp.pdf";
+  fs.writeFileSync(filePath, buffer);
+  return filePath;
+}
 
 const isMediaFile = (fileType) => {
   const mediaTypes = ["image/", "video/", "audio/", "application/pdf"];
@@ -88,7 +363,6 @@ const io = new Server(server, {
       "http://localhost:3000",
       "https://localhost:3000",
       "http://localhost:3001",
-
     ],
     methods: ["GET", "POST"],
   },
@@ -181,6 +455,7 @@ const removeElementFromSlide = (
 // Socket events
 io.on("connection", (socket) => {
   console.log("Socket connected:", socket.id);
+  registerPdfUploadHandler(io, socket);
   // console.log(socket)
 
   // Join a room (class)
@@ -457,34 +732,46 @@ io.on("connection", (socket) => {
   });
 
   // File transfer handlers
-  socket.on("file", ({ roomID, fileName, fileType, fileData }) => {
-    console.log(
-      `File transfer - Name: ${fileName}, Type: ${fileType}, Room: ${roomID}`
-    );
-    if (isMediaFile(fileType)) {
-      console.log("Media file detected - applying compression");
-      const compressedFile = compress({ fileName, fileType, fileData });
-      socket.broadcast.to(roomID).emit("file-media", compressedFile);
-    } else if (isUrlOrTextFile(fileType, fileName)) {
-      console.log("URL/Text file detected - sending without compression");
-      socket.broadcast
-        .to(roomID)
-        .emit("file-url", { fileName, fileType, fileData });
-    } else {
-      console.log("Other file type detected - applying compression as default");
-      const compressedFile = compress({ fileName, fileType, fileData });
-      socket.broadcast.to(roomID).emit("file-other", compressedFile);
-    }
-    // Fallback generic event (fixed spelling)
-    socket.broadcast
-      .to(roomID)
-      .emit("file-received", { fileName, fileType, fileData });
-    console.log(
-      `Broadcasting file to ${
-        rooms[roomID]?.users?.length || 0
-      } users in room ${roomID}`
-    );
-  });
+  // socket.on("file", ({ roomID, fileName, fileType, fileData }) => {
+  //   console.log(
+  //     `File transfer - Name: ${fileName}, Type: ${fileType}, Room: ${roomID}`
+  //   );
+  //   if (isMediaFile(fileType)) {
+  //     console.log("Media file detected - applying compression");
+  //     const compressedFile = compress({ fileName, fileType, fileData });
+  //     socket.broadcast.to(roomID).emit("file-media", compressedFile);
+  //   } else if (isUrlOrTextFile(fileType, fileName)) {
+  //     console.log("URL/Text file detected - sending without compression");
+  //     socket.broadcast
+  //       .to(roomID)
+  //       .emit("file-url", { fileName, fileType, fileData });
+  //   } else {
+  //     console.log("Other file type detected - applying compression as default");
+  //     const compressedFile = compress({ fileName, fileType, fileData });
+  //     socket.broadcast.to(roomID).emit("file-other", compressedFile);
+  //   }
+  //   // Fallback generic event (fixed spelling)
+  //   socket.broadcast
+  //     .to(roomID)
+  //     .emit("file-received", { fileName, fileType, fileData });
+  //   console.log(
+  //     `Broadcasting file to ${
+  //       rooms[roomID]?.users?.length || 0
+  //     } users in room ${roomID}`
+  //   );
+  // });
+
+  // socket.on("upload-pdf", ({ roomID, fileName, fileType, fileData }) => {
+  //   console.log(`PDF uploaded by client: ${fileName}`);
+
+  //   // Broadcast to all other users
+  //   io.to(roomID).emit("pdf-received", {
+  //     roomID,
+  //     fileName,
+  //     fileType,
+  //     fileData,
+  //   });
+  // });
 
   // Website sharing
   socket.on("share-website", ({ websiteUrl, roomID, userID }) => {
