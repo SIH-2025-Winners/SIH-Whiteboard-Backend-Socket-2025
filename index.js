@@ -4,6 +4,7 @@ const app = express();
 const http = require("http");
 const cors = require("cors");
 const { Server } = require("socket.io");
+const streamifier = require("streamifier");
 const pako = require("pako");
 require("dotenv").config();
 // If you don't use GoogleGenerativeAI in production, you can rem related code
@@ -131,10 +132,10 @@ async function processFullPdf(io, socket, roomID, fileName, fileBuffer) {
             id: elementId,
             type: "image",
             src: url,
-            x1: 50,
-            y1: 50,
+            x1: 10,
+            y1: 10,
             width: width,
-            height: height,
+            height: height/2,
             rotation: 0,
             locked: false,
           },
@@ -149,7 +150,7 @@ async function processFullPdf(io, socket, roomID, fileName, fileBuffer) {
         currentSlide: room.currentSlide,
       });
 
-      console.log("Emitted slide:", slideId);
+      console.log("Emitted slide: Object", slide);
     }
 
     await fs.remove(tmpDir);
@@ -174,54 +175,99 @@ async function savePdfTemp(fileDataArray) {
 }
 
 // helper: convert pdf to images using pdf-poppler
+// async function convertPdfToImages(pdfPath, outputDir) {
+//   await fs.ensureDir(outputDir);
+
+//   const opts = {
+//     format: "png", // png or jpeg
+//     out_dir: outputDir,
+//     out_prefix: "slide",
+//     page: null, // null => all pages
+//     scale: 1090, // adjust quality/size; higher = bigger images
+//   };
+
+//   // pdf-poppler returns a Promise
+//   console.log("Converting PDF to images...");
+//   await pdfPoppler.convert(pdfPath, opts);
+//   console.log("PDF conversion done. Listing output files...");
+
+//   // list output files in lexicographic order (slide-1.png, slide-2.png, ...)
+//   const files = (await fs.readdir(outputDir))
+//     .filter(
+//       (f) => f.startsWith("slide") && (f.endsWith(".png") || f.endsWith(".jpg"))
+//     )
+//     .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }))
+//     .map((f) => path.join(outputDir, f));
+//   console.log("Converted image files:", files);
+
+//   return files;
+// }
+
 async function convertPdfToImages(pdfPath, outputDir) {
-  await fs.ensureDir(outputDir);
+  console.log("Uploading PDF to Cloudinary for conversion...");
 
-  const opts = {
-    format: "png", // png or jpeg
-    out_dir: outputDir,
-    out_prefix: "slide",
-    page: null, // null => all pages
-    scale: 1090, // adjust quality/size; higher = bigger images
-  };
+  // Upload full PDF to Cloudinary
+  const uploadRes = await cloudinary.uploader.upload(pdfPath, {
+    resource_type: "image", // IMPORTANT for PDF
+    format: 'pdf',
+    folder: "pdf-temp",
+    use_filename: true,
+    unique_filename: true,
+  });
 
-  // pdf-poppler returns a Promise
-  console.log("Converting PDF to images...");
-  await pdfPoppler.convert(pdfPath, opts);
-  console.log("PDF conversion done. Listing output files...");
+  console.log("PDF uploaded to Cloudinary:", uploadRes.public_id);
 
-  // list output files in lexicographic order (slide-1.png, slide-2.png, ...)
-  const files = (await fs.readdir(outputDir))
-    .filter(
-      (f) => f.startsWith("slide") && (f.endsWith(".png") || f.endsWith(".jpg"))
-    )
-    .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }))
-    .map((f) => path.join(outputDir, f));
-  console.log("Converted image files:", files);
+  // Cloudinary se number of pages nikalo
+  let totalPages = 1;
 
-  return files;
+  if (uploadRes.pages) {
+    totalPages = uploadRes.pages;
+  } else if (uploadRes.n_pages) {
+    totalPages = uploadRes.n_pages;
+  }
+
+  console.log("Total PDF pages detected:", totalPages);
+
+  // Fake local paths create kar rahe for pipeline compatibility
+  const cloudImagePaths = [];
+
+  for (let i = 1; i <= totalPages; i++) {
+    const imageUrl = cloudinary.url(uploadRes.public_id, {
+      resource_type: "image",
+      format: "png",
+      page: i,
+      width: 2000,
+      crop: "scale",
+      secure: true,
+    });
+
+    // 👇 local-like fake path (compatible with uploadImagesToCloudinary)
+    cloudImagePaths.push(imageUrl);
+  }
+
+  return cloudImagePaths;
 }
 
 // helper: upload local image paths to cloudinary (returns secure urls)
-async function uploadImagesToCloudinary(imagePaths, roomID) {
-  const urls = [];
-  for (const p of imagePaths) {
-    console.log("Uploading image to Cloudinary:", p);
-    const res = await cloudinary.uploader.upload(p, {
-      folder: `whiteboard/${roomID}`,
-      resource_type: "image",
-      use_filename: true,
-      unique_filename: true,
-    });
-    urls.push({
-      url: res.secure_url,
-      width: res.width,
-      height: res.height,
-    });
-  }
-  console.log("All images uploaded to Cloudinary.");
-  return urls;
-}
+// async function uploadImagesToCloudinary(imagePaths, roomID) {
+//   const urls = [];
+//   for (const p of imagePaths) {
+//     console.log("Uploading image to Cloudinary:", p);
+//     const res = await cloudinary.uploader.upload(p, {
+//       folder: `whiteboard/${roomID}`,
+//       resource_type: "image",
+//       use_filename: true,
+//       unique_filename: true,
+//     });
+//     urls.push({
+//       url: res.secure_url,
+//       width: res.width,
+//       height: res.height,
+//     });
+//   }
+//   console.log("All images uploaded to Cloudinary.");
+//   return urls;
+// }
 
 // main socket handler registration (call this from where you have `io` and `socket`)
 // function registerPdfUploadHandler(io, socket) {
@@ -313,6 +359,40 @@ async function uploadImagesToCloudinary(imagePaths, roomID) {
 //     }
 //   });
 // }
+
+async function uploadImagesToCloudinary(imagePaths, roomID) {
+  const urls = [];
+
+  for (const p of imagePaths) {
+    let res;
+
+    // ✅ If already Cloudinary URL (coming from convertPdfToImages)
+    if (p.startsWith("https://")) {
+      res = {
+        secure_url: p,
+        width: 1600,
+        height: 2000,
+      };
+    } else {
+      // ✅ Legacy: local files
+      res = await cloudinary.uploader.upload(p, {
+        folder: `whiteboard/${roomID}`,
+        resource_type: "image",
+        use_filename: true,
+        unique_filename: true,
+      });
+    }
+
+    urls.push({
+      url: res.secure_url || p,
+      width: res.width || 1600,
+      height: res.height || 2000,
+    });
+  }
+
+  console.log("All images uploaded/processed. URLs : ", urls);
+  return urls;
+}
 
 const compress = (data) => {
   const json = JSON.stringify(data);
