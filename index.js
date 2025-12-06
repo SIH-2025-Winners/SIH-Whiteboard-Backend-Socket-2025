@@ -14,7 +14,7 @@ const { default: Classes } = require("./models/Classes");
 const fs = require("fs-extra");
 const path = require("path");
 const { v4: uuidv4 } = require("uuid");
-const pdfPoppler = require("pdf-poppler");
+// const pdfPoppler = require("pdf-poppler");
 const cloudinary = require("cloudinary").v2;
 
 const server = http.createServer(app);
