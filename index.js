@@ -25,6 +25,7 @@ app.use(
     origin: [
       "*",
       "https://sih-2025-white-board.vercel.app",
+      "https://sih-2025-whiteboard-frontend.vercel.app",
       "http://localhost:3001",
       "https://localhost:3000",
     ],
@@ -438,6 +439,7 @@ const io = new Server(server, {
     origin: [
       "*",
       "https://sih-2025-white-board.vercel.app",
+      "https://sih-2025-whiteboard-frontend.vercel.app",
       "http://localhost:3000",
       "https://localhost:3000",
       "http://localhost:3001",
