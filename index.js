@@ -6,7 +6,7 @@ const cors = require("cors");
 const { Server } = require("socket.io");
 const pako = require("pako");
 require("dotenv").config();
-// If you don't use GoogleGenerativeAI in production, you can remove related code
+// If you don't use GoogleGenerativeAI in production, you can rem related code
 const { GoogleGenerativeAI } = require("@google/generative-ai");
 const connectDB = require("./lib/dbConnect");
 const { default: Classes } = require("./models/Classes");
