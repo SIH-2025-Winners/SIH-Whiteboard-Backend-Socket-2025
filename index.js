@@ -467,6 +467,11 @@ const ensureRoom = (roomID) => {
   }
 };
 
+const ensureRoomDoubts = (roomID) => {
+  ensureRoom(roomID); // already exists
+  if (!rooms[roomID].doubts) rooms[roomID].doubts = [];
+};
+
 // Helper: get slide object by slideId or by index
 const getSlideByIdOrIndex = (
   roomID,
@@ -553,6 +558,8 @@ io.on("connection", (socket) => {
     socket.roomID = roomID;
 
     ensureRoom(roomID);
+    ensureRoomDoubts(roomID);
+    
 
     // add to room's user list (avoid duplicates)
     rooms[roomID].users = rooms[roomID].users.filter(
@@ -567,6 +574,7 @@ io.on("connection", (socket) => {
       users: rooms[roomID].users.map((u) => u.userID),
     };
     socket.emit("whiteboard-state", roomState);
+    socket.emit("update-doubts", rooms[roomID].doubts);
 
     // Notify others in room that a new user joined
     socket.broadcast
@@ -578,6 +586,34 @@ io.on("connection", (socket) => {
         UserID
       )}. Slides: ${rooms[roomID].slides.length}`
     );
+  });
+
+  socket.on("post-doubt", ({ roomID, doubtText, doubtId }) => {
+    ensureRoomDoubts(roomID);
+
+    const newDoubt = {
+      id: doubtId, // client generates uuid
+      doubt: doubtText,
+      votes: 1, // initial vote by poster
+    };
+
+    rooms[roomID].doubts.push(newDoubt);
+
+    // Broadcast to everyone in the room
+    io.to(roomID).emit("update-doubts", rooms[roomID].doubts);
+  });
+
+  // Student upvotes a doubt
+  socket.on("upvote-doubt", ({ roomID, doubtId }) => {
+    ensureRoomDoubts(roomID);
+
+    const doubt = rooms[roomID].doubts.find((d) => d.id === doubtId);
+    if (doubt) {
+      doubt.votes += 1;
+
+      // Broadcast updated doubts to room
+      io.to(roomID).emit("update-doubts", rooms[roomID].doubts);
+    }
   });
 
   socket.on("whiteboard:saveAll", async ({ roomID }) => {
