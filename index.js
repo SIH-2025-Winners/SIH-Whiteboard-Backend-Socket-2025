@@ -49,10 +49,8 @@ app.use(express.json());
  * Note: This is memory-only. For persistence, move to DB.
  */
 let rooms = {};
+
 const pdfChunkStore = {};
-setInterval(() => {
-  console.log("\n\n rooms state:", JSON.stringify(rooms));
-}, 3000);
 
 // setInterval(() => {
 //   console.log("\n\nCurrent rooms state:", JSON.stringify(rooms));
@@ -68,11 +66,27 @@ cloudinary.config({
 
 function registerPdfUploadHandler(io, socket) {
   socket.on(
+    "upload-pdf-start",
+    ({ roomID, fileName, fileType, totalChunks }) => {
+      const key = `${roomID}-${fileName}`;
+
+      // Broadcast to all students in room
+      io.to(roomID).emit("pdf-upload-start", {
+        key,
+        fileName,
+        fileType,
+        totalChunks,
+      });
+
+      console.log("PDF upload started:", key, totalChunks);
+    }
+  );
+
+  socket.on(
     "upload-pdf-chunk",
     async ({ roomID, fileName, fileType, chunkIndex, totalChunks, chunk }) => {
       const key = `${roomID}-${fileName}`;
 
-      // Create storage if not exists
       if (!pdfChunkStore[key]) {
         pdfChunkStore[key] = {
           chunks: [],
@@ -83,22 +97,36 @@ function registerPdfUploadHandler(io, socket) {
         };
       }
 
-      // Save chunk
-      pdfChunkStore[key].chunks[chunkIndex] = Buffer.from(chunk);
+      // Save chunk as Buffer
+      const buffer = Buffer.from(chunk);
+      pdfChunkStore[key].chunks[chunkIndex] = buffer;
 
       const received = pdfChunkStore[key].chunks.filter(Boolean).length;
       console.log(`PDF chunk ${received}/${totalChunks} received`);
 
-      // If PDF fully received
+      // Convert chunk to base64 for forwarding
+      const chunkBase64 = buffer.toString("base64");
+
+      io.to(roomID).emit("pdf-chunk-forward", {
+        key,
+        fileName,
+        fileType,
+        chunkIndex,
+        totalChunks,
+        chunkBase64,
+        fromSocketId: socket.id,
+      });
+
+      console.log(`Forwarded chunk ${chunkIndex} to room ${roomID}`);
+
+      // If fully received
       if (received === totalChunks) {
         console.log("All chunks received, assembling...");
 
         const finalBuffer = Buffer.concat(pdfChunkStore[key].chunks);
 
-        // Clear chunk storage
         delete pdfChunkStore[key];
 
-        // Process the PDF using your existing pipeline
         await processFullPdf(io, socket, roomID, fileName, finalBuffer);
       }
     }
@@ -127,6 +155,28 @@ async function processFullPdf(io, socket, roomID, fileName, fileBuffer) {
       const { url, width, height } = cloudUrls[i];
       const slideId = `slide-${Date.now()}-${uuidv4()}`;
       const elementId = `el-${uuidv4()}`;
+      // Assume max allowed width on canvas
+      const MAX_CANVAS_WIDTH = 1800; // adjust as you want
+      const MAX_CANVAS_HEIGHT = 900;
+
+      // Maintain aspect ratio
+      const aspectRatio = width / height;
+
+      // Scale width to fit inside whiteboard
+      let finalWidth = width;
+      let finalHeight = height;
+
+      // Reduce width if too large
+      if (finalWidth > MAX_CANVAS_WIDTH) {
+        finalWidth = MAX_CANVAS_WIDTH;
+        finalHeight = Math.round(finalWidth / aspectRatio);
+      }
+
+      // If height still too big, reduce height
+      if (finalHeight > MAX_CANVAS_HEIGHT) {
+        finalHeight = MAX_CANVAS_HEIGHT;
+        finalWidth = Math.round(finalHeight * aspectRatio);
+      }
 
       const slide = {
         id: slideId,
@@ -136,10 +186,10 @@ async function processFullPdf(io, socket, roomID, fileName, fileBuffer) {
             id: elementId,
             type: "image",
             src: url,
-            x1: 10,
-            y1: 10,
-            width: width,
-            height: height / 2,
+            x1: 100,
+            y1: 100,
+            width: finalHeight,
+            height: finalWidth,
             rotation: 0,
             locked: false,
           },
@@ -177,6 +227,8 @@ async function savePdfTemp(fileDataArray) {
   console.log("PDF saved at:", pdfPath);
   return { pdfPath, tmpDir };
 }
+
+
 
 // helper: convert pdf to images using pdf-poppler
 // async function convertPdfToImages(pdfPath, outputDir) {
@@ -559,7 +611,6 @@ io.on("connection", (socket) => {
 
     ensureRoom(roomID);
     ensureRoomDoubts(roomID);
-    
 
     // add to room's user list (avoid duplicates)
     rooms[roomID].users = rooms[roomID].users.filter(
@@ -898,11 +949,11 @@ io.on("connection", (socket) => {
 
   // Cursor position broadcast (attached to room)
   socket.on("cursor-position", ({ cursorData, roomID }) => {
-    console.log(
-      `\n\nCursor from user ${JSON.stringify(
-        cursorData
-      )} in room ${roomID}: x=${cursorData.x}, y=${cursorData.y}`
-    );
+    // console.log(
+    //   `\n\nCursor from user ${JSON.stringify(
+    //     cursorData
+    //   )} in room ${roomID}: x=${cursorData.x}, y=${cursorData.y}`
+    // );
     socket.broadcast
       .to(roomID)
       .emit("cursor-position-backend", { ...cursorData });
