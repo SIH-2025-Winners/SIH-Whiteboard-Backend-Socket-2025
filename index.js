@@ -30,7 +30,8 @@ app.use(
       "https://sih-2025-whiteboard-frontend.vercel.app",
       "http://localhost:3001",
       "https://localhost:3000",
-      "http://localhost:3000"
+      "http://localhost:3000",
+      "https://sentiment-analysis-djoh.onrender.com"
     ],
   })
 );
@@ -518,6 +519,7 @@ const io = new Server(server, {
       "http://localhost:3000",
       "https://localhost:3000",
       "http://localhost:3001",
+      "https://sentiment-analysis-djoh.onrender.com"
     ],
     methods: ["GET", "POST"],
   },
@@ -1002,9 +1004,31 @@ io.on("connection", (socket) => {
     io.to(roomID).emit("website-closed", { userID, roomID });
   });
 
+  socket.on("sentiment-response", ({label}) => {
+    socket.emit("sentiment-result", {label});
+  });
+
   // Messaging
   socket.on("message", ({ roomID, compressedMessage }) => {
+    const binary = Buffer.from(compressedMessage, "base64").toString("binary");
+
+    // Binary → Uint8Array
+    const uint8 = Uint8Array.from(binary, (c) => c.charCodeAt(0));
+
+    // Decompress → JSON string
+    const jsonString = pako.inflate(uint8, { to: "string" });
+
+    // Convert to object
+    const data = JSON.parse(jsonString);
+
+    // ⬅️ Extract only the message
+    const { message } = data;
+
+    console.log("Extracted message:", message);
+
     console.log("message:", compressedMessage ? "[compressed]" : "[empty]");
+    console.log("Emitting sentiment request for message analysis" + message);
+    socket.emit("sentiment-request", {text: message});
     socket.broadcast.to(roomID).emit("message", compressedMessage);
   });
 
